@@ -32,6 +32,7 @@ function makeRoomCode(len = 4): string {
   return Array.from(buf, (n) => ROOM_ALPHABET[n % ROOM_ALPHABET.length]).join('')
 }
 
+
 export type Phase = 'landing' | 'connecting' | 'active'
 
 export interface SyncApi {
@@ -43,6 +44,7 @@ export interface SyncApi {
   localTime: number
   targetTime: number | null
   audioRouted: boolean // audio routed through Web Audio (ignores iOS mute switch)
+  audioAutoLatencyMs: number // auto-measured output latency being compensated
   // video selection (screen)
   videos: VideoOption[]
   videoId: string
@@ -76,6 +78,7 @@ export function useSync(): SyncApi {
     writeKeepAwakePref(on)
     setKeepAwakeState(on)
   }, [])
+
 
   const sessionActive = phase === 'active' && controller != null
   const { supported: wakeLockSupported, held: wakeLockActive } = useWakeLock(sessionActive, keepAwake)
@@ -151,6 +154,7 @@ export function useSync(): SyncApi {
       if (controller.role === 'follower') {
         audio.resume()
         audio.resync()
+        syncEpochRef.current = controller.getState().syncEpoch
       } else if (screenWasPlaying) {
         void video.play().catch(() => {})
       }
@@ -232,6 +236,7 @@ export function useSync(): SyncApi {
     localTime,
     targetTime,
     audioRouted: audioRef.current?.routedThroughWebAudio ?? false,
+    audioAutoLatencyMs: audioRef.current?.autoLatencyMs ?? 0,
     videos: VIDEOS,
     videoId,
     setVideoId,

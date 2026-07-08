@@ -100,6 +100,16 @@ Keep the audio a stream-copy of the video's own track so their timelines match e
   which plays regardless of the mute switch. The debug panel's `audio out` row shows
   `web-audio (mute-switch safe)` when this is active. AAC/m4a itself is natively supported
   on iOS — format is not the issue.
+- **Automatic output-latency compensation (BYOD — no manual calibration):** what you *hear*
+  trails `element.currentTime` by the device's output latency (~100–300 ms on iOS; Bluetooth
+  adds even more). We measure it at runtime from `AudioContext.getOutputTimestamp()`
+  (`currentTime − contextTime` = the true scheduling→output delay, and it reflects the real
+  output path *including Bluetooth*), smoothed, with `outputLatency` as a fallback and a
+  conservative iOS default only if both read 0. The element is steered ahead by that amount
+  so the *audible* audio lands on the video. The debug `latency comp: auto N ms` shows the
+  live estimate (≈220 ms on the test Chrome). Note: `outputLatency` is unreliable
+  (0 on iOS Safari and 0-until-warmup on Chrome), which is why `getOutputTimestamp` is the
+  primary signal.
 - The follower's `soundtrack.m4a` is a **stream-copy of the video's own AAC**, so their
   timelines are bit-identical (no encoder-delay offset).
 - Fixed leader (no migration); star topology (no gossip relay). Swap the Trystero strategy

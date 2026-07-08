@@ -8,10 +8,10 @@
 import { SYNTH_SOUNDTRACK_URL } from '../content'
 import { signedDrift, correctionRate } from '../sync/sync-math'
 
-const HARD_SEEK_SEC = 0.45 // snap when drift is clearly uncorrectable by rate alone
-const SEEK_COOLDOWN_MS = 8000 // iOS seeks stall playback — keep them rare
+const HARD_SEEK_SEC = 0.6 // iOS seeks stall — only snap on large drift
+const SEEK_COOLDOWN_MS = 8000 // keep hard seeks rare
 const SEEK_SETTLE_MS = 400 // after a hard seek, let iOS resume before re-steering
-const LOCK_DEADBAND_SEC = 0.12 // hold rate=1 inside this band
+const LOCK_DEADBAND_SEC = 0.07 // hold rate=1 inside this band (±70ms — within the "good" A/V-sync range)
 const LOCKED_SEC = 0.02 // UI "locked" threshold (tighter than the correction deadband)
 const DRIFT_EMA_ALPHA = 0.25 // smooth noisy drift samples before steering
 const RATE_EPS = 0.003 // skip playbackRate writes that wouldn't audibly change
@@ -19,6 +19,13 @@ const TRACK_EPS_SEC = 0.003 // element time must advance by this much to be trus
 const RATE_GAIN = 0.5
 const RATE_MIN = 0.97
 const RATE_MAX = 1.03
+const MAX_LATENCY_SEC = 0.5 // clamp auto-measured output latency to something sane
+const LATENCY_EMA_ALPHA = 0.2 // smooth the latency estimate
+const IOS_FALLBACK_LATENCY_SEC = 0.12 // last resort when neither API reports (iOS)
+const IS_IOS =
+  typeof navigator !== 'undefined' &&
+  (/iP(hone|ad|od)/.test(navigator.userAgent) ||
+    (/Macintosh/.test(navigator.userAgent) && (navigator.maxTouchPoints ?? 0) > 1))
 
 export type CorrectionMode = 'idle' | 'seek' | 'nudge' | 'locked'
 export interface CorrectionInfo {
@@ -31,6 +38,7 @@ export class AudioSyncController {
   private el: HTMLAudioElement
   private currentUrl: string
   private ctx: AudioContext | null = null
+  private srcNode: MediaElementAudioSourceNode | null = null
   private routed = false
   private hardStopped = false
   private smoothedDriftSec = 0
@@ -39,15 +47,13 @@ export class AudioSyncController {
   private trackedSec = 0
   private lastTrackAt = 0
   private seekSettleUntil = 0
+  private measuredLatencySec = 0 // auto-measured output latency (see sampleOutputLatency)
   unlocked = false
 
   constructor() {
-    // Prime with the synthetic soundtrack so unlock() has something to play; the actual
-    // track is swapped in via setSource() once we know which video the screen selected.
     const el = new Audio(SYNTH_SOUNDTRACK_URL)
     el.loop = true
     el.preload = 'auto'
-    // Preserve pitch while we speed/slow to correct drift.
     el.preservesPitch = true
     const anyEl = el as unknown as Record<string, unknown>
     anyEl.mozPreservesPitch = true
@@ -56,37 +62,25 @@ export class AudioSyncController {
     this.currentUrl = SYNTH_SOUNDTRACK_URL
   }
 
-  /** Swap the soundtrack (keeps the same, already-unlocked element). No-op if unchanged. */
   setSource(url: string): void {
     if (!url || url === this.currentUrl) return
     this.currentUrl = url
-    this.el.src = url // triggers a reload; the corrector re-seeks on the next tick
+    this.el.src = url
     this.trackedSec = 0
     this.lastTrackAt = 0
     this.smoothedDriftSec = 0
   }
 
   get currentTimeSec(): number {
-    return this.el.currentTime
+    return this.trackedSec || this.el.currentTime
   }
   get duration(): number {
     return this.el.duration
   }
-  /** True once the element is routed through Web Audio (ignores the iOS mute switch). */
   get routedThroughWebAudio(): boolean {
     return this.routed
   }
 
-  /**
-   * Call inside a real user gesture (the join tap).
-   *
-   * Besides satisfying the autoplay gate, we route the element through a Web Audio
-   * graph. On iOS a bare <audio>/<video> element is "ambient" audio and is silenced by
-   * the ringer/mute switch (and in silent mode) — playback keeps advancing but you hear
-   * nothing. Audio played through the Web Audio API is NOT subject to that switch, so
-   * connecting the element to an AudioContext makes it audible on iOS regardless. The
-   * context must be created + resumed inside the gesture.
-   */
   async unlock(): Promise<void> {
     this.hardStopped = false
     this.smoothedDriftSec = 0
@@ -102,16 +96,19 @@ export class AudioSyncController {
       if (Ctx && !this.ctx) {
         this.ctx = new Ctx()
         try {
-          // createMediaElementSource may only be called once per element.
-          this.ctx.createMediaElementSource(this.el).connect(this.ctx.destination)
+          // Create the source but DON'T connect to the destination yet — priming the
+          // element (below) then makes no sound, so the listener never hears the test
+          // soundtrack blip during the join tap. We connect after priming.
+          this.srcNode = this.ctx.createMediaElementSource(this.el)
           this.routed = true
         } catch {
-          this.routed = false // routing unsupported; fall back to the bare element
+          this.routed = false
         }
       }
 
-      // Fire play() + resume() inside the gesture (before any long await).
-      this.el.muted = false
+      // Prime inside the gesture to unlock the element + resume the context. Muted, and
+      // (when routed) not yet connected to output → silent.
+      this.el.muted = true
       const playPromise = this.el.play()
       const resumePromise =
         this.ctx && this.ctx.state === 'suspended' ? this.ctx.resume() : Promise.resolve()
@@ -119,15 +116,67 @@ export class AudioSyncController {
 
       this.el.pause()
       this.el.currentTime = 0
+      this.el.muted = false
+      // Now route to the output for real, audible playback.
+      if (this.srcNode && this.ctx) this.srcNode.connect(this.ctx.destination)
       this.unlocked = true
     } catch {
       this.unlocked = true
     }
   }
 
-  /** Re-resume the Web Audio context (iOS suspends it when backgrounded). Safe to call often. */
   resume(): void {
     if (this.ctx && this.ctx.state === 'suspended') void this.ctx.resume().catch(() => {})
+  }
+
+  /**
+   * Web Audio output is delayed behind element.currentTime. Steer toward a target that
+   * accounts for that latency so we don't perpetually chase a phantom ~500–700 ms gap.
+   */
+  /**
+   * Auto-measure the device's true output latency (element position → what's actually
+   * heard) so we can steer the element ahead by exactly that much — fully automatic, no
+   * user calibration (this is BYOD).
+   *
+   * Primary signal: getOutputTimestamp() — (currentTime − contextTime) is the full
+   * scheduling→output delay and reflects the REAL output path, INCLUDING Bluetooth
+   * (which varies 100–300 ms and no fixed constant could cover). Fallback: outputLatency
+   * (flaky — reads 0 on iOS Safari, and 0 until warmup even on Chrome). Last resort on
+   * iOS, where both can read 0: a conservative default so audio isn't left uncompensated.
+   */
+  private sampleOutputLatency(): void {
+    const ctx = this.ctx
+    if (!ctx) return
+    let L: number | null = null
+    const g = ctx.getOutputTimestamp?.()
+    if (g && typeof g.contextTime === 'number' && g.contextTime > 0) {
+      const d = ctx.currentTime - g.contextTime
+      if (d > 0.001 && d < 1) L = d
+    }
+    if (L == null && typeof ctx.outputLatency === 'number' && ctx.outputLatency > 0) {
+      L = ctx.outputLatency + (ctx.baseLatency ?? 0)
+    }
+    if (L == null && IS_IOS && this.measuredLatencySec < 0.02) {
+      L = IOS_FALLBACK_LATENCY_SEC
+    }
+    if (L == null) return
+    L = Math.min(MAX_LATENCY_SEC, Math.max(0, L))
+    this.measuredLatencySec = this.measuredLatencySec
+      ? this.measuredLatencySec * (1 - LATENCY_EMA_ALPHA) + L * LATENCY_EMA_ALPHA
+      : L
+  }
+
+  private outputLatencySec(): number {
+    return this.routed ? this.measuredLatencySec : 0
+  }
+  get autoLatencyMs(): number {
+    return this.outputLatencySec() * 1000
+  }
+
+  private steerTarget(targetSec: number, dur: number): number {
+    const shift = this.outputLatencySec()
+    if (shift <= 0) return targetSec
+    return (((targetSec + shift) % dur) + dur) % dur
   }
 
   private setPlaybackRate(rate: number): void {
@@ -161,7 +210,6 @@ export class AudioSyncController {
     this.lastTrackAt = Date.now()
   }
 
-  /** Steer local audio toward `targetSec` (screen position). Returns info for the UI. */
   correct(targetSec: number | null, playing: boolean): CorrectionInfo {
     if (this.hardStopped) {
       if (!this.el.paused) this.el.pause()
@@ -176,14 +224,16 @@ export class AudioSyncController {
 
     const dur = this.el.duration
     if (!isFinite(dur) || dur <= 0) {
-      void this.el.play().catch(() => {}) // metadata not ready yet
+      void this.el.play().catch(() => {})
       return { mode: 'idle', driftMs: 0, rate: this.lastAppliedRate }
     }
 
     if (this.el.paused) void this.el.play().catch(() => {})
 
+    this.sampleOutputLatency() // keep the auto latency estimate fresh
     const localSec = this.sampleLocalSec()
-    const rawDrift = signedDrift(localSec, targetSec, dur) // + = ahead
+    const aim = this.steerTarget(targetSec, dur)
+    const rawDrift = signedDrift(localSec, aim, dur)
     this.smoothedDriftSec =
       DRIFT_EMA_ALPHA * rawDrift + (1 - DRIFT_EMA_ALPHA) * this.smoothedDriftSec
     const drift = this.smoothedDriftSec
@@ -191,13 +241,14 @@ export class AudioSyncController {
     const now = Date.now()
     const cooldownElapsed = now - this.lastSeekAt >= SEEK_COOLDOWN_MS
     const settled = now >= this.seekSettleUntil
+
     if (
       settled &&
       cooldownElapsed &&
       Math.abs(rawDrift) > HARD_SEEK_SEC &&
       Math.abs(drift) > HARD_SEEK_SEC * 0.75
     ) {
-      const seekTo = ((targetSec % dur) + dur) % dur
+      const seekTo = aim
       try {
         this.el.currentTime = seekTo
       } catch {
@@ -233,7 +284,6 @@ export class AudioSyncController {
     }
   }
 
-  /** Drop corrector state after reconnect / wake so a hard seek can run immediately. */
   resync(): void {
     this.smoothedDriftSec = 0
     this.lastSeekAt = 0
