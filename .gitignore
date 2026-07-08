@@ -1,0 +1,18 @@
+node_modules
+dist
+dev-dist
+.DS_Store
+*.log
+
+# Large local-only media (real content). Regenerate from source with ffmpeg — see README.
+# The small synthetic test clip in src/content/ IS committed (offline default).
+public/media/
+
+# Yarn 4 (node-modules linker)
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.pnp.*

@@ -1,0 +1,202 @@
+/* Skeletal styling — tech spike. */
+:root {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: #111;
+  color: #eee;
+  line-height: 1.4;
+}
+.wrap {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 16px;
+}
+h1 {
+  font-size: 1.4rem;
+  margin: 0.2em 0;
+}
+h2 {
+  font-size: 1.1rem;
+}
+.muted {
+  color: #999;
+}
+.small {
+  font-size: 0.85rem;
+}
+.hint {
+  color: #7a7;
+  font-size: 0.85rem;
+}
+.error {
+  color: #f77;
+}
+code {
+  background: #222;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.roomcode {
+  letter-spacing: 0.15em;
+  font-weight: bold;
+}
+.roomcode.big {
+  font-size: 1.4rem;
+}
+button {
+  font: inherit;
+  padding: 10px 14px;
+  margin: 6px 6px 6px 0;
+  border: 1px solid #444;
+  border-radius: 8px;
+  background: #2a5bd7;
+  color: #fff;
+  cursor: pointer;
+}
+button.ghost {
+  background: transparent;
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+input {
+  font: inherit;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #444;
+  background: #1b1b1b;
+  color: #fff;
+  width: 100%;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+.card {
+  border: 1px solid #333;
+  border-radius: 10px;
+  padding: 14px;
+  margin: 12px 0;
+  background: #171717;
+}
+.field {
+  display: block;
+  margin: 8px 0;
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+  cursor: pointer;
+  user-select: none;
+}
+.check input {
+  width: auto;
+  margin: 0;
+  accent-color: #2a5bd7;
+}
+select {
+  font: inherit;
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #444;
+  background: #1b1b1b;
+  color: #fff;
+}
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #333;
+}
+.video-wrap {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 10px 0;
+}
+.share {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+.connecting {
+  margin: 12px 0;
+  padding: 12px;
+  background: #2a2410;
+  border: 1px solid #6b5a1e;
+  border-radius: 8px;
+  color: #f0d68a;
+}
+
+/* Drift instrument */
+.drift-hero {
+  text-align: center;
+  padding: 24px;
+  margin: 12px 0;
+  border-radius: 12px;
+  border: 1px solid #333;
+  background: #141414;
+}
+.drift-num {
+  font-size: 3rem;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+.drift-unit {
+  font-size: 1.2rem;
+  font-weight: 400;
+  color: #999;
+}
+.drift-good {
+  color: #4ade80;
+}
+.drift-warn {
+  color: #fbbf24;
+}
+.drift-bad {
+  color: #f87171;
+}
+
+/* Debug panel */
+.debug {
+  margin-top: 20px;
+  border: 1px dashed #555;
+  border-radius: 10px;
+  padding: 12px;
+  background: #0d0d0d;
+  font-size: 0.9rem;
+}
+.debug h2 {
+  margin-top: 0;
+  color: #8ab4ff;
+}
+.dbg-row {
+  display: flex;
+  gap: 10px;
+  padding: 3px 0;
+  border-bottom: 1px solid #1c1c1c;
+}
+.dbg-key {
+  width: 120px;
+  color: #888;
+  flex-shrink: 0;
+}
+.dbg-val {
+  flex: 1;
+  word-break: break-word;
+}
