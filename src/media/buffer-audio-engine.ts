@@ -78,9 +78,13 @@ export class BufferAudioEngine {
   }
 
   setSource(url: string): void {
-    if (!url || this.desiredUrl === url) return
+    if (!url) return
     this.desiredUrl = url
-    this.load(url)
+    this.load(url) // dedupes internally; retries if the context wasn't ready yet
+  }
+
+  hasBufferFor(url: string): boolean {
+    return this.buffer != null && this.bufferUrl === url
   }
 
   private load(url: string): void {

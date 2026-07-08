@@ -29,6 +29,8 @@ export function FollowerView({ api }: { api: SyncApi }) {
 
       {!s.screenOnline ? (
         <div className="connecting">Waiting for the screen… (no sync beats yet)</div>
+      ) : api.correction.mode === 'syncing' ? (
+        <div className="connecting">Syncing audio… (downloading the soundtrack)</div>
       ) : (
         <div className={`drift-hero ${cls}`}>
           <div className="drift-num">

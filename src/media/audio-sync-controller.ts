@@ -8,8 +8,9 @@
  *  - Buffer (iOS): Safari's media-element pipeline stalls >1s on seeks and spontaneously
  *    mid-playback, and it ignores fine playbackRate adjustments — element-side correction
  *    is unworkable there. Followers play a decoded AudioBuffer on the AudioContext clock
- *    instead (see BufferAudioEngine). The element stays primed as a fallback in case
- *    fetch/decode of the soundtrack fails.
+ *    instead (see BufferAudioEngine). While the soundtrack downloads/decodes the follower
+ *    reports a 'syncing' state (silent — cleaner than the element's stuttery streaming
+ *    playback); the element remains primed only as a fallback if fetch/decode fails.
  *
  * Autoplay gate: unlock() must run inside the join tap (fires play() before any await).
  */
@@ -35,7 +36,7 @@ const IS_IOS =
   (/iP(hone|ad|od)/.test(navigator.userAgent) ||
     (/Macintosh/.test(navigator.userAgent) && (navigator.maxTouchPoints ?? 0) > 1))
 
-export type CorrectionMode = 'idle' | 'seek' | 'nudge' | 'locked'
+export type CorrectionMode = 'idle' | 'syncing' | 'seek' | 'nudge' | 'locked'
 export interface CorrectionInfo {
   mode: CorrectionMode
   driftMs: number // signed: + = local audio is AHEAD of the screen
@@ -57,12 +58,10 @@ export class AudioSyncController {
   private lastObservedSec = -1
   private seekSettleUntil = 0
   private needsInitialSync = true // snap to the live target on join/resync, however small the drift
-  private blobbedUrl: string | null = null // logical URL the current blob src represents
-  private blobLoadingUrl: string | null = null
-  private objectUrl: string | null = null
   private measuredLatencySec = 0 // auto-measured output latency (see sampleOutputLatency)
   private bufferEngine: BufferAudioEngine | null = null
-  private useBuffer = IS_IOS
+  private useBuffer = false // buffer engine is the active output (iOS, once decoded)
+  private bufferUpgradePending = IS_IOS // element is bootstrapping while the buffer decodes
   unlocked = false
 
   constructor() {
@@ -80,60 +79,27 @@ export class AudioSyncController {
     }
   }
 
+  private get bufferEngineWanted(): boolean {
+    return this.bufferEngine != null && (this.useBuffer || this.bufferUpgradePending)
+  }
+
   private fallbackToElement(): void {
-    if (!this.useBuffer) return
+    this.bufferUpgradePending = false
+    if (!this.useBuffer) return // element is already (still) the active output
     this.useBuffer = false
     this.el.src = this.currentUrl
     this.resetAfterSourceChange()
-    this.ensureBlobSource()
   }
 
   setSource(url: string): void {
     if (!url) return
-    if (this.useBuffer) {
-      if (url !== this.currentUrl) this.currentUrl = url
-      this.bufferEngine!.setSource(url)
-      return
-    }
-    if (url !== this.currentUrl) {
-      this.currentUrl = url
-      this.el.src = url // start streaming immediately; the blob swap below follows
-      this.blobbedUrl = null
+    const changed = url !== this.currentUrl
+    this.currentUrl = url
+    if (this.bufferEngineWanted) this.bufferEngine!.setSource(url) // kicks download+decode
+    if (!this.bufferEngineWanted && changed) {
+      this.el.src = url // element streams (the active output on non-iOS / after fallback)
       this.resetAfterSourceChange()
     }
-    this.ensureBlobSource()
-  }
-
-  /**
-   * Browsers stream media with a shallow buffer (and range requests through the service
-   * worker never fill its cache — partial 206 responses aren't cacheable), which risks
-   * mid-playback rebuffer stalls. Downloading the soundtrack fully and playing from an
-   * object URL makes the element buffered end-to-end: no stalls, and every seek is cheap.
-   */
-  private ensureBlobSource(): void {
-    const url = this.currentUrl
-    if (this.blobbedUrl === url || this.blobLoadingUrl === url) return
-    this.blobLoadingUrl = url
-    void fetch(url)
-      .then((r) => {
-        if (!r.ok) throw new Error(`fetch ${r.status}`)
-        return r.blob()
-      })
-      .then((blob) => {
-        if (this.currentUrl !== url) return // source changed while downloading
-        const obj = URL.createObjectURL(blob)
-        if (this.objectUrl) URL.revokeObjectURL(this.objectUrl)
-        this.objectUrl = obj
-        this.blobbedUrl = url
-        this.el.src = obj
-        this.resetAfterSourceChange()
-      })
-      .catch(() => {
-        /* offline or fetch failed — keep streaming from the network URL */
-      })
-      .finally(() => {
-        if (this.blobLoadingUrl === url) this.blobLoadingUrl = null
-      })
   }
 
   private resetAfterSourceChange(): void {
@@ -169,9 +135,9 @@ export class AudioSyncController {
     this.seekSettleUntil = 0
     this.needsInitialSync = true
     // iOS: unlock the buffer engine's context inside this gesture (idempotent — also
-    // clears its stopped state on re-join). The element below is still primed too
-    // (silently), so the fallback path stays usable if decode fails.
-    const bufferUnlock = this.useBuffer
+    // clears its stopped state on re-join). The element below is primed too since it
+    // bootstraps playback while the buffer decodes and is the fallback if decode fails.
+    const bufferUnlock = this.bufferEngineWanted
       ? this.bufferEngine!.unlock().catch(() => {
           this.fallbackToElement()
         })
@@ -220,7 +186,7 @@ export class AudioSyncController {
   }
 
   resume(): void {
-    if (this.useBuffer) this.bufferEngine!.resume()
+    if (this.bufferEngineWanted) this.bufferEngine!.resume()
     if (this.ctx && this.ctx.state === 'suspended') void this.ctx.resume().catch(() => {})
   }
 
@@ -303,6 +269,19 @@ export class AudioSyncController {
   }
 
   correct(targetSec: number | null, playing: boolean): CorrectionInfo {
+    if (this.bufferUpgradePending) {
+      if (this.bufferEngine!.hasBufferFor(this.currentUrl)) {
+        // Decoded soundtrack just became available — the buffer engine takes over
+        // (it snaps straight onto the live target on its first tick).
+        this.bufferUpgradePending = false
+        this.useBuffer = true
+      } else {
+        // Stay silent while downloading/decoding rather than limping along on the
+        // stuttery element pipeline; the UI shows this as "syncing".
+        if (!this.el.paused) this.el.pause()
+        return { mode: 'syncing', driftMs: 0, rate: 1 }
+      }
+    }
     if (this.useBuffer) return this.bufferEngine!.correct(targetSec, playing)
     if (this.hardStopped) {
       if (!this.el.paused) this.el.pause()
