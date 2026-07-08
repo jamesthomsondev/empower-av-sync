@@ -1,27 +1,35 @@
 /**
  * Follower-side audio: plays the local soundtrack and continuously corrects it toward the
- * screen's video position. Small drifts are closed by nudging `playbackRate` (pitch
- * preserved) so there's no audible jump; large drifts (including a loop wrap) hard-seek.
+ * screen's video position.
  *
- * iOS autoplay gate: unlock() must run inside the join tap (fires play() before any await).
+ * Engines:
+ *  - Element (Android/desktop): <audio> routed through Web Audio. Small drifts are closed
+ *    by nudging `playbackRate` (pitch preserved, no audible jump); large drifts hard-seek.
+ *  - Buffer (iOS): Safari's media-element pipeline stalls >1s on seeks and spontaneously
+ *    mid-playback, and it ignores fine playbackRate adjustments — element-side correction
+ *    is unworkable there. Followers play a decoded AudioBuffer on the AudioContext clock
+ *    instead (see BufferAudioEngine). The element stays primed as a fallback in case
+ *    fetch/decode of the soundtrack fails.
+ *
+ * Autoplay gate: unlock() must run inside the join tap (fires play() before any await).
  */
 import { SYNTH_SOUNDTRACK_URL } from '../content'
 import { signedDrift, correctionRate } from '../sync/sync-math'
+import { BufferAudioEngine } from './buffer-audio-engine'
 
-const HARD_SEEK_SEC = 0.6 // iOS seeks stall — only snap on large drift
+const HARD_SEEK_SEC = 0.6 // only snap on large drift; the nudge closes anything smaller
 const SEEK_COOLDOWN_MS = 8000 // keep hard seeks rare
-const SEEK_SETTLE_MS = 400 // after a hard seek, let iOS resume before re-steering
+const SEEK_SETTLE_MS = 400 // after a hard seek, let playback resume before re-steering
 const LOCK_DEADBAND_SEC = 0.07 // hold rate=1 inside this band (±70ms — within the "good" A/V-sync range)
 const LOCKED_SEC = 0.02 // UI "locked" threshold (tighter than the correction deadband)
 const DRIFT_EMA_ALPHA = 0.25 // smooth noisy drift samples before steering
 const RATE_EPS = 0.003 // skip playbackRate writes that wouldn't audibly change
-const TRACK_EPS_SEC = 0.003 // element time must advance by this much to be trusted
 const RATE_GAIN = 0.5
 const RATE_MIN = 0.97
 const RATE_MAX = 1.03
 const MAX_LATENCY_SEC = 0.5 // clamp auto-measured output latency to something sane
 const LATENCY_EMA_ALPHA = 0.2 // smooth the latency estimate
-const IOS_FALLBACK_LATENCY_SEC = 0.12 // last resort when neither API reports (iOS)
+const IOS_FALLBACK_LATENCY_SEC = 0.12 // last resort when nothing reports (iOS)
 const IS_IOS =
   typeof navigator !== 'undefined' &&
   (/iP(hone|ad|od)/.test(navigator.userAgent) ||
@@ -46,8 +54,15 @@ export class AudioSyncController {
   private lastAppliedRate = 1
   private trackedSec = 0
   private lastTrackAt = 0
+  private lastObservedSec = -1
   private seekSettleUntil = 0
+  private needsInitialSync = true // snap to the live target on join/resync, however small the drift
+  private blobbedUrl: string | null = null // logical URL the current blob src represents
+  private blobLoadingUrl: string | null = null
+  private objectUrl: string | null = null
   private measuredLatencySec = 0 // auto-measured output latency (see sampleOutputLatency)
+  private bufferEngine: BufferAudioEngine | null = null
+  private useBuffer = IS_IOS
   unlocked = false
 
   constructor() {
@@ -60,25 +75,89 @@ export class AudioSyncController {
     anyEl.webkitPreservesPitch = true
     this.el = el
     this.currentUrl = SYNTH_SOUNDTRACK_URL
+    if (IS_IOS) {
+      this.bufferEngine = new BufferAudioEngine(() => this.fallbackToElement())
+    }
+  }
+
+  private fallbackToElement(): void {
+    if (!this.useBuffer) return
+    this.useBuffer = false
+    this.el.src = this.currentUrl
+    this.resetAfterSourceChange()
+    this.ensureBlobSource()
   }
 
   setSource(url: string): void {
-    if (!url || url === this.currentUrl) return
-    this.currentUrl = url
-    this.el.src = url
+    if (!url) return
+    if (this.useBuffer) {
+      if (url !== this.currentUrl) this.currentUrl = url
+      this.bufferEngine!.setSource(url)
+      return
+    }
+    if (url !== this.currentUrl) {
+      this.currentUrl = url
+      this.el.src = url // start streaming immediately; the blob swap below follows
+      this.blobbedUrl = null
+      this.resetAfterSourceChange()
+    }
+    this.ensureBlobSource()
+  }
+
+  /**
+   * Browsers stream media with a shallow buffer (and range requests through the service
+   * worker never fill its cache — partial 206 responses aren't cacheable), which risks
+   * mid-playback rebuffer stalls. Downloading the soundtrack fully and playing from an
+   * object URL makes the element buffered end-to-end: no stalls, and every seek is cheap.
+   */
+  private ensureBlobSource(): void {
+    const url = this.currentUrl
+    if (this.blobbedUrl === url || this.blobLoadingUrl === url) return
+    this.blobLoadingUrl = url
+    void fetch(url)
+      .then((r) => {
+        if (!r.ok) throw new Error(`fetch ${r.status}`)
+        return r.blob()
+      })
+      .then((blob) => {
+        if (this.currentUrl !== url) return // source changed while downloading
+        const obj = URL.createObjectURL(blob)
+        if (this.objectUrl) URL.revokeObjectURL(this.objectUrl)
+        this.objectUrl = obj
+        this.blobbedUrl = url
+        this.el.src = obj
+        this.resetAfterSourceChange()
+      })
+      .catch(() => {
+        /* offline or fetch failed — keep streaming from the network URL */
+      })
+      .finally(() => {
+        if (this.blobLoadingUrl === url) this.blobLoadingUrl = null
+      })
+  }
+
+  private resetAfterSourceChange(): void {
     this.trackedSec = 0
     this.lastTrackAt = 0
+    this.lastObservedSec = -1
     this.smoothedDriftSec = 0
+    this.needsInitialSync = true
   }
 
   get currentTimeSec(): number {
+    if (this.useBuffer) return this.bufferEngine!.currentTimeSec
     return this.trackedSec || this.el.currentTime
   }
   get duration(): number {
+    if (this.useBuffer) return this.bufferEngine!.duration
     return this.el.duration
   }
   get routedThroughWebAudio(): boolean {
-    return this.routed
+    return this.useBuffer || this.routed
+  }
+  get autoLatencyMs(): number {
+    if (this.useBuffer) return this.bufferEngine!.autoLatencyMs
+    return this.outputLatencySec() * 1000
   }
 
   async unlock(): Promise<void> {
@@ -88,12 +167,26 @@ export class AudioSyncController {
     this.trackedSec = 0
     this.lastTrackAt = 0
     this.seekSettleUntil = 0
-    if (this.unlocked) return
+    this.needsInitialSync = true
+    // iOS: unlock the buffer engine's context inside this gesture (idempotent — also
+    // clears its stopped state on re-join). The element below is still primed too
+    // (silently), so the fallback path stays usable if decode fails.
+    const bufferUnlock = this.useBuffer
+      ? this.bufferEngine!.unlock().catch(() => {
+          this.fallbackToElement()
+        })
+      : null
+    if (this.unlocked) {
+      if (bufferUnlock) await bufferUnlock
+      return
+    }
     try {
       const Ctx =
         window.AudioContext ||
         (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
-      if (Ctx && !this.ctx) {
+      // On iOS the element is only the fallback and plays directly (no Web Audio routing:
+      // Safari's MediaElementSource pipeline is the thing we're avoiding).
+      if (Ctx && !this.ctx && !IS_IOS) {
         this.ctx = new Ctx()
         try {
           // Create the source but DON'T connect to the destination yet — priming the
@@ -123,16 +216,14 @@ export class AudioSyncController {
     } catch {
       this.unlocked = true
     }
+    if (bufferUnlock) await bufferUnlock
   }
 
   resume(): void {
+    if (this.useBuffer) this.bufferEngine!.resume()
     if (this.ctx && this.ctx.state === 'suspended') void this.ctx.resume().catch(() => {})
   }
 
-  /**
-   * Web Audio output is delayed behind element.currentTime. Steer toward a target that
-   * accounts for that latency so we don't perpetually chase a phantom ~500–700 ms gap.
-   */
   /**
    * Auto-measure the device's true output latency (element position → what's actually
    * heard) so we can steer the element ahead by exactly that much — fully automatic, no
@@ -141,8 +232,7 @@ export class AudioSyncController {
    * Primary signal: getOutputTimestamp() — (currentTime − contextTime) is the full
    * scheduling→output delay and reflects the REAL output path, INCLUDING Bluetooth
    * (which varies 100–300 ms and no fixed constant could cover). Fallback: outputLatency
-   * (flaky — reads 0 on iOS Safari, and 0 until warmup even on Chrome). Last resort on
-   * iOS, where both can read 0: a conservative default so audio isn't left uncompensated.
+   * (flaky — reads 0 until warmup even on Chrome).
    */
   private sampleOutputLatency(): void {
     const ctx = this.ctx
@@ -156,9 +246,6 @@ export class AudioSyncController {
     if (L == null && typeof ctx.outputLatency === 'number' && ctx.outputLatency > 0) {
       L = ctx.outputLatency + (ctx.baseLatency ?? 0)
     }
-    if (L == null && IS_IOS && this.measuredLatencySec < 0.02) {
-      L = IOS_FALLBACK_LATENCY_SEC
-    }
     if (L == null) return
     L = Math.min(MAX_LATENCY_SEC, Math.max(0, L))
     this.measuredLatencySec = this.measuredLatencySec
@@ -167,10 +254,9 @@ export class AudioSyncController {
   }
 
   private outputLatencySec(): number {
-    return this.routed ? this.measuredLatencySec : 0
-  }
-  get autoLatencyMs(): number {
-    return this.outputLatencySec() * 1000
+    if (this.routed) return this.measuredLatencySec
+    // Plain element output (the iOS fallback) has real device latency we can't measure.
+    return IS_IOS ? IOS_FALLBACK_LATENCY_SEC : 0
   }
 
   private steerTarget(targetSec: number, dur: number): number {
@@ -180,37 +266,44 @@ export class AudioSyncController {
   }
 
   private setPlaybackRate(rate: number): void {
-    if (Math.abs(rate - this.lastAppliedRate) <= RATE_EPS) return
-    this.el.playbackRate = rate
+    // Compare against the element's ACTUAL rate, not a cache of what we last wrote —
+    // engines may silently reset playbackRate to 1 after seeks/stalls/interruptions,
+    // and trusting a cache would leave the nudge corrector permanently inert.
     this.lastAppliedRate = rate
+    const actual = this.el.playbackRate
+    if (Math.abs(rate - actual) <= RATE_EPS) return
+    try {
+      this.el.playbackRate = rate
+    } catch {
+      /* some engines reject rates mid-load */
+    }
   }
 
-  /** iOS often freezes `currentTime` after a seek; advance an internal clock when that happens. */
+  /**
+   * Honest local clock: trust any fresh element reading — even one BEHIND the previous
+   * value — and advance an internal clock ONLY while the element clock is genuinely
+   * frozen (e.g. briefly around seeks). A forward-only ratchet here once let the
+   * synthetic clock detach from real playback and measure drift against its own
+   * assumption, hiding genuine desync.
+   */
   private sampleLocalSec(): number {
     const observed = this.el.currentTime
     const now = Date.now()
-    if (this.el.paused || this.lastTrackAt === 0) {
-      this.trackedSec = observed
-      this.lastTrackAt = now
-      return observed
-    }
-    if (observed > this.trackedSec + TRACK_EPS_SEC) {
+    const alive = observed !== this.lastObservedSec
+    this.lastObservedSec = observed
+    if (alive || this.el.paused || this.lastTrackAt === 0) {
       this.trackedSec = observed
       this.lastTrackAt = now
       return observed
     }
     const dt = (now - this.lastTrackAt) / 1000
-    this.trackedSec += dt * this.lastAppliedRate
+    this.trackedSec += dt * (this.el.playbackRate || 1)
     this.lastTrackAt = now
     return this.trackedSec
   }
 
-  private syncTrackedSec(sec: number): void {
-    this.trackedSec = sec
-    this.lastTrackAt = Date.now()
-  }
-
   correct(targetSec: number | null, playing: boolean): CorrectionInfo {
+    if (this.useBuffer) return this.bufferEngine!.correct(targetSec, playing)
     if (this.hardStopped) {
       if (!this.el.paused) this.el.pause()
       return { mode: 'idle', driftMs: 0, rate: 1 }
@@ -242,19 +335,23 @@ export class AudioSyncController {
     const cooldownElapsed = now - this.lastSeekAt >= SEEK_COOLDOWN_MS
     const settled = now >= this.seekSettleUntil
 
-    if (
-      settled &&
-      cooldownElapsed &&
-      Math.abs(rawDrift) > HARD_SEEK_SEC &&
-      Math.abs(drift) > HARD_SEEK_SEC * 0.75
-    ) {
-      const seekTo = aim
+    const needsSnap =
+      this.needsInitialSync ||
+      (settled &&
+        cooldownElapsed &&
+        Math.abs(rawDrift) > HARD_SEEK_SEC &&
+        Math.abs(drift) > HARD_SEEK_SEC * 0.75)
+
+    if (needsSnap) {
+      this.needsInitialSync = false
       try {
-        this.el.currentTime = seekTo
+        this.el.currentTime = aim
       } catch {
-        /* not seekable yet */
+        /* not seekable yet — the next tick retries via drift */
       }
-      this.syncTrackedSec(seekTo)
+      this.trackedSec = aim
+      this.lastTrackAt = now
+      this.lastObservedSec = this.el.currentTime
       this.smoothedDriftSec = 0
       this.lastSeekAt = now
       this.seekSettleUntil = now + SEEK_SETTLE_MS
@@ -285,14 +382,20 @@ export class AudioSyncController {
   }
 
   resync(): void {
+    if (this.useBuffer) {
+      this.bufferEngine!.resync()
+      return
+    }
     this.smoothedDriftSec = 0
     this.lastSeekAt = 0
     this.seekSettleUntil = 0
+    this.needsInitialSync = true
     this.trackedSec = this.el.currentTime
     this.lastTrackAt = Date.now()
   }
 
   stop(): void {
+    this.bufferEngine?.stop()
     this.hardStopped = true
     this.el.pause()
     this.el.playbackRate = 1
@@ -300,5 +403,6 @@ export class AudioSyncController {
     this.trackedSec = 0
     this.lastTrackAt = 0
     this.seekSettleUntil = 0
+    this.needsInitialSync = true
   }
 }

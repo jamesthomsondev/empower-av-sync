@@ -105,6 +105,7 @@ export function useSync(): SyncApi {
   const audioRef = useRef<AudioSyncController | null>(null)
   if (!audioRef.current) audioRef.current = new AudioSyncController()
   const syncEpochRef = useRef(0)
+  const clockReadyRef = useRef(false)
 
   useEffect(() => {
     if (!controller) return
@@ -122,6 +123,13 @@ export function useSync(): SyncApi {
       if (st.syncEpoch !== syncEpochRef.current) {
         syncEpochRef.current = st.syncEpoch
         audio.resync()
+      }
+      if (st.clockReady && !clockReadyRef.current) {
+        clockReadyRef.current = true
+        audio.resync()
+        syncEpochRef.current = st.syncEpoch
+      } else if (!st.clockReady) {
+        clockReadyRef.current = false
       }
       const beat = st.latestBeat
       const now = Date.now()
@@ -202,6 +210,7 @@ export function useSync(): SyncApi {
       await audioRef.current!.unlock() // play() fired inside the gesture
       const c = await joinAsFollower(code.trim().toUpperCase())
       syncEpochRef.current = c.getState().syncEpoch
+      clockReadyRef.current = c.getState().clockReady
       setController(c)
       setPhase('active')
     } catch (e) {
