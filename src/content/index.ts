@@ -29,16 +29,17 @@ export interface VideoOption {
 
 export const VIDEOS: VideoOption[] = [
   {
-    id: 'test',
-    label: 'Test clip — sync cues (20s, offline)',
+    id: "test",
+    label: "Test clip — sync cues (20s, offline)",
     videoUrl: screenVideo,
     soundtrackUrl: soundtrack,
   },
   {
-    id: 'soh',
-    label: 'SOH Sync — Long (~15m, real content)',
-    videoUrl: '/media/soh.mp4',
-    soundtrackUrl: '/media/soh.m4a',
+    id: "soh",
+    label: "SOH Sync — Long (~15m, real content)",
+    videoUrl:
+      "https://content.dev.pladia.live/assets/playground/james/soh.mp4",
+    soundtrackUrl: "/media/soh.m4a",
   },
 ]
 
